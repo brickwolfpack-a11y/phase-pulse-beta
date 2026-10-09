@@ -39,6 +39,23 @@
       "challenge_signals": [],
       "search_records": 24,
       "note": "Search response alone is insufficient: per-product fulfillment still requires verification."
+    },
+    "walmart": {
+      "checked_at": "2026-10-09T01:08:34.433240+00:00",
+      "requests": 1,
+      "result": "FAIL",
+      "endpoint": "www.walmart.com/search",
+      "user_agent": "PHASE-PULSE-Beta/0.1",
+      "cookies": false,
+      "retry": false,
+      "http_status": 412,
+      "content_type": "application/json; charset=UTF-8",
+      "server": "",
+      "response_bytes": 396,
+      "challenge_signals": [
+        "captcha"
+      ],
+      "note": "Request stopped. No alternate endpoint or automatic retry."
     }
   }
 }
