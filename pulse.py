@@ -34,7 +34,7 @@ def request(url, payload=None):
             if len(body)>5_000_000: raise CheckError('Response exceeds size limit')
             text = body.decode('utf-8')
     except urllib.error.HTTPError as e:
-        raise CheckError('HTTP '+str(e.code), e.code in (401,403,429)) from None
+        raise CheckError('HTTP '+str(e.code), e.code in (401,403,412,429,435)) from None
     except (urllib.error.URLError, TimeoutError, OSError):
         raise CheckError('Network request failed; no automatic retry') from None
     if payload is None and re.search(r'<title[^>]*>[^<]*(robot or human|access denied)|verify you are human|px-captcha',text,re.I):
@@ -93,31 +93,25 @@ def check_walmart(cfg,old):
     return list(products.values()),raw
 
 def check_target(cfg,old):
-    # Per-product fulfillment avoids false OOS from truncated search result pages.
-    ids=list(dict.fromkeys(cfg['target_tcins']+list(old.get('products',{}))))
-    for term in cfg['search_keywords']:
-        d=target_get('plp_search_v2',{'keyword':term,'count':24,'offset':0,'default_purchasability_filter':'false','page':'/search','platform':'desktop'},cfg)
-        rows=d.get('data',{}).get('search',{}).get('products')
-        if not isinstance(rows,list):raise CheckError('Target search schema changed')
-        for raw in rows:
-            item=raw.get('item',{})
-            if item.get('fulfillment',{}).get('is_marketplace') is False and matches(item.get('product_description',{}).get('title',''),cfg):
-                if str(raw['tcin']) not in ids:ids.append(str(raw['tcin']))
-        time.sleep(cfg['request_spacing_seconds'])
-    products=[]
-    for tcin in ids[:cfg['max_target_products']]:
-        d=target_get('pdp_client_v1',{'tcin':tcin},cfg);prod=d.get('data',{}).get('product',{})
-        if str(prod.get('tcin'))!=tcin:raise CheckError('Target product identity mismatch')
-        item=prod.get('item',{});name=html.unescape(item.get('product_description',{}).get('title',''))
-        if item.get('fulfillment',{}).get('is_marketplace') is True or not matches(name,cfg):continue
-        url=item.get('enrichment',{}).get('buy_url','')
-        if not valid_url(url,'target'):raise CheckError('Invalid Target product URL')
-        time.sleep(cfg['request_spacing_seconds'])
+    import discovery
+    if cfg.get('paused_retailers',{}).get('target'):
+        raise CheckError(cfg['paused_retailers']['target'],True)
+    try: discovery.collect(cfg,old,target_get,now,time.sleep)
+    except ValueError as exc: raise CheckError(str(exc)) from None
+    ids=discovery.select_watchlist(cfg,old);products=[]
+    for tcin in ids:
+        metadata=old.get('discovery',{}).get('products',{}).get(tcin) or old.get('products',{}).get(tcin)
+        if not metadata or not valid_url(metadata.get('url',''),'target'):
+            raise CheckError('Target metadata not verified for TCIN '+tcin)
         d=target_get('product_fulfillment_and_variation_hierarchy_v1',{'tcin':tcin,'page':'/p/A-'+tcin},cfg)
-        p=d.get('data',{}).get('product',{})
-        if str(p.get('tcin'))!=tcin or not isinstance(p.get('fulfillment'),dict):raise CheckError('Target fulfillment missing')
-        f=p['fulfillment'];products.append({'id':tcin,'name':name,'url':url,'status':target_status(f),'checked_at':now(),'evidence':'shipping_options.availability_status','price':prod.get('price',{}).get('current_retail')})
-        time.sleep(cfg['request_spacing_seconds'])
+        product=d.get('data',{}).get('product',{})
+        if str(product.get('tcin'))!=tcin or not isinstance(product.get('fulfillment'),dict):raise CheckError('Target fulfillment missing')
+        fulfillment=product['fulfillment']
+        products.append({'id':tcin,'name':metadata['name'],'url':metadata['url'],
+            'status':target_status(fulfillment),'checked_at':now(),
+            'source_status':fulfillment.get('shipping_options',{}).get('availability_status'),
+            'evidence':'shipping_options.availability_status'})
+        time.sleep(max(2,cfg.get('request_spacing_seconds',2)))
     return products,len(ids)
 
 def merge(old,rows,retailer):
@@ -135,6 +129,9 @@ def check(cfg,state):
     report={'checked_at':now(),'retailers':{},'alerts_sent':0}
     for retailer,fn in [('target',check_target),('walmart',check_walmart)]:
         old=state.setdefault(retailer,{'products':{}})
+        configured_pause=cfg.get('paused_retailers',{}).get(retailer)
+        if configured_pause:
+            report['retailers'][retailer]={'status':'paused','reason':configured_pause,'last_success':old.get('last_success')};continue
         if old.get('paused'):
             report['retailers'][retailer]={'status':'paused','reason':old['paused']};continue
         try:
