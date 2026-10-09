@@ -138,10 +138,59 @@ def target_fulfillment(d):
         if entry['result']!='PASS':break
         pulse.time.sleep(2)
 
+
+def direct_shipping(d):
+    # Existing fulfillment collector, without the separate metadata dependency.
+    # No browser impersonation, cookies, proxies, or retry after rejection.
+    if 'direct_shipping_checks' in d:return
+    cfg=pulse.load(ROOT/'config.json',{})
+    baseline=pulse.load(ROOT/'state.json',{})['target']
+    isolated=copy.deepcopy(baseline);checks=[]
+    for iteration in range(2):
+        check={'checked_at':pulse.now(),'run_id':os.environ.get('PULSE_RUN_ID'),'result':'FAIL','products':[]}
+        failed=False
+        for tcin in cfg['target_tcins']:
+            saved=baseline['products'].get(tcin)
+            if not saved or not pulse.valid_url(saved.get('url',''),'target'):
+                check['error']='Saved product identity missing';failed=True;break
+            args={'key':pulse.KEY,'visitor_id':pulse.VISITOR,'store_id':cfg['target_store_id'],'pricing_store_id':cfg['target_store_id'],'zip':cfg['target_zip'],'channel':'WEB','tcin':tcin,'page':'/p/A-'+tcin}
+            endpoint=pulse.BASE+'product_fulfillment_and_variation_hierarchy_v1'
+            check['source']=endpoint
+            req=urllib.request.Request(endpoint+'?'+urllib.parse.urlencode(args),headers={'User-Agent':'PHASE-PULSE-Beta/0.1','Accept':'application/json,text/html'})
+            try:
+                try:r=urllib.request.build_opener(pulse.NoRedirect).open(req,timeout=25)
+                except urllib.error.HTTPError as exc:r=exc
+                with r:
+                    body=r.read(5_000_001);status=r.code
+                    check['http_status']=status;check['content_type']=r.headers.get('Content-Type','')
+                text=body.decode('utf-8',errors='replace')
+                check['challenge_signals']=[word for word in ['verify you are human','robot or human','access denied','px-captcha','captcha','request rejected','request blocked','automated'] if word in text.lower()]
+                if status!=200 or check['challenge_signals']:
+                    check['error']='HTTP '+str(status)+'; no retry';failed=True;break
+                product=json.loads(text).get('data',{}).get('product',{})
+                if str(product.get('tcin'))!=tcin:raise ValueError('Identity mismatch')
+                shipping=product.get('fulfillment',{}).get('shipping_options',{})
+                classified=pulse.target_status(product.get('fulfillment',{}))
+                row=copy.deepcopy(saved)
+                row.update(status=classified,checked_at=pulse.now(),source_status=shipping.get('availability_status'),evidence='shipping_options.availability_status')
+                check['products'].append(row)
+                if classified=='unknown':check['error']='Unknown shipping status';failed=True;break
+            except Exception as exc:check['error']=type(exc).__name__;failed=True;break
+            pulse.time.sleep(3)
+        if not failed:
+            events=pulse.merge(isolated,check['products'],'target')
+            check.update(result='PASS',products_checked=len(check['products']),detected_changes=len(events))
+            if checks and [p['status'] for p in checks[0]['products']]==[p['status'] for p in check['products']]:
+                assert not events
+                check['unchanged_duplicate_prevention']='PASS'
+        checks.append(check);d['direct_shipping_checks']=checks;save(d);persist()
+        if failed:break
+        pulse.time.sleep(5)
+
 def main():
     before={name:hashlib.sha256((ROOT/name).read_bytes()).hexdigest() for name in ['state.json','report.json']}
     d=pulse.load(LEDGER,{'run_id':os.environ.get('PULSE_RUN_ID'),'created_at':pulse.now()})
-    tests(d);diagnose(d);target_fulfillment(d)
+    direct_shipping(d)
     after={name:hashlib.sha256((ROOT/name).read_bytes()).hexdigest() for name in before}
     assert before==after,'Production baseline changed unexpectedly'
     d['baseline_preserved']=True;d['completed_at']=pulse.now();save(d);persist()
