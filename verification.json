@@ -91,6 +91,19 @@
       "challenge_signals": [],
       "products_checked": 1,
       "detected_changes": 0
+    },
+    {
+      "checked_at": "2026-10-09T01:15:19.623544+00:00",
+      "run_id": "37868846468-1",
+      "result": "FAIL",
+      "products": [],
+      "source": "https://redsky.target.com/redsky_aggregations/v1/web/product_fulfillment_and_variation_hierarchy_v1",
+      "http_status": 435,
+      "content_type": "application/json",
+      "challenge_signals": [
+        "captcha"
+      ],
+      "error": "HTTP 435; no retry"
     }
   ]
 }
