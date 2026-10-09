@@ -1,0 +1,54 @@
+name: PHASE PULSE Beta
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: phase-pulse-beta
+  cancel-in-progress: false
+jobs:
+  monitor:
+    if: vars.PULSE_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      PULSE_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Test classification and duplicate controls
+        run: python3 -m unittest discover -s . -v
+      - name: Retrieve real retailer inventory
+        id: inventory
+        continue-on-error: true
+        run: python3 pulse.py check
+      - name: Persist inventory and error state
+        run: bash commit-state.sh
+      - name: Reserve genuine events
+        env:
+          DISCORD_TARGET_WEBHOOK_URL: ${{ secrets.DISCORD_TARGET_WEBHOOK_URL }}
+          DISCORD_WALMART_WEBHOOK_URL: ${{ secrets.DISCORD_WALMART_WEBHOOK_URL }}
+        run: python3 pulse.py reserve
+      - name: Persist reservations before delivery
+        run: bash commit-state.sh
+      - name: Deliver genuine changes
+        env:
+          DISCORD_TARGET_WEBHOOK_URL: ${{ secrets.DISCORD_TARGET_WEBHOOK_URL }}
+          DISCORD_WALMART_WEBHOOK_URL: ${{ secrets.DISCORD_WALMART_WEBHOOK_URL }}
+        run: python3 pulse.py deliver
+      - name: Persist delivery results
+        if: always()
+        run: bash commit-state.sh
+      - name: Report health
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import os,pathlib
+          p=pathlib.Path('report.json')
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:
+              f.write('## PHASE PULSE beta inventory evidence\n\n```json\n'+(p.read_text() if p.exists() else '{"status":"no report"}')+'\n```\n')
+          PY
+      - name: Mark unsuccessful inventory checks
+        if: steps.inventory.outcome == 'failure'
+        run: exit 1
