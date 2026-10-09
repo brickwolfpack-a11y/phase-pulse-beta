@@ -13,7 +13,7 @@
       }
     },
     "last_success": "2026-10-09T00:34:08.365539+00:00",
-    "last_error": null
+    "last_error": "HTTP 435"
   },
   "walmart": {
     "products": {
@@ -259,6 +259,6 @@
       }
     },
     "last_success": "2026-10-09T00:34:45.631788+00:00",
-    "last_error": null
+    "last_error": "HTTP 412"
   }
 }
