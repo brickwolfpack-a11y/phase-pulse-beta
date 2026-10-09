@@ -1,6 +1,6 @@
 # PHASE PULSE beta
 
-Status: baseline verified locally; cloud deployment and Discord delivery not yet verified.
+Status: deployed; monitoring PAUSED after the first hosted inventory test failed. Discord delivery remains unverified.
 
 Run `python3 pulse.py check` from the repository root. Python 3.11+ standard library only: no npm install, browser runtime, personal bot session, proxy, or retailer account required.
 
@@ -12,13 +12,22 @@ Run `python3 pulse.py check` from the repository root. Python 3.11+ standard lib
 - Pokémon, One Piece, Panini, Topps and Funko keyword searches configured. Configuration does not imply that every category produced a matching first-party item.
 - Zero genuine stock-change events observed during baseline; zero Discord messages sent.
 
-## Deployment (not completed)
+## Deployment checkpoint — 2026-10-09 UTC
 
-1. Create or reuse one PHASE repository. Public standard GitHub-hosted runners avoid private-repository minute charges; code and retailer stock state may be public, never credentials.
-2. Push this reviewed revision. Only `.github/workflows/monitor.yml` is scheduled; it runs the Python beta rather than the upstream Node program.
-3. Store the EXISTING channel webhook URLs as repository Actions secrets `DISCORD_TARGET_WEBHOOK_URL` and `DISCORD_WALMART_WEBHOOK_URL`. Do not make replacement channels or webhooks. Do not put secrets in code, state, artifacts, command arguments or logs.
-4. Set repository variable `PULSE_ENABLED=true` only after secrets and configuration are verified. Dispatch a manual run, inspect live retailer evidence on the hosted runner, then observe a scheduled run.
-5. Schedule: UTC minutes 7, 22, 37 and 52. GitHub may delay or drop scheduled jobs; this is a beta, not a latency guarantee. The cloud job does not require the user's computer to remain on. This independence must still be verified by an actual hosted run.
+- Repository, Python monitor, tests, persistent inventory state and workflow saved.
+- Existing Target and Walmart Discord webhooks stored as encrypted Actions secrets `DISCORD_TARGET_WEBHOOK_URL` and `DISCORD_WALMART_WEBHOOK_URL`; no channels or webhooks duplicated.
+- First manually dispatched GitHub-hosted run: https://github.com/brickwolfpack-a11y/phase-pulse-beta/actions/runs/37867059374 . All 10 unit tests passed, but the actual retailer checks failed at 00:53:47 UTC: Target HTTP 435; Walmart HTTP 412. Those status codes alone do not establish the underlying cause.
+- `report.json` and the preserved baseline were committed by the workflow. Zero stock-change alerts or verification messages were delivered.
+- Repository variable `PULSE_ENABLED=false` was saved after this failure. The 15-minute cron remains defined (UTC minutes 7, 22, 37 and 52), but inventory jobs are paused. Do not re-enable merely to retry these rejected endpoints.
+- The hosted job proves execution independent of the user's computer, but does NOT prove functioning hosted inventory retrieval or Discord delivery. This beta is NOT LIVE.
+- Last genuine successful checks remain the local baseline: Target 2026-10-09 00:34:08 UTC (1 product); Walmart 00:34:45 UTC (24 products, 18 explicitly in stock at that time). These are historical observations, not current stock promises.
+
+### Required next steps
+
+1. Resolve supported retailer access or obtain an authorized dedicated monitor feed before re-enabling inventory requests. No proxy, personal-token, CAPTCHA, fingerprint or network-path bypass.
+2. After access is resolved, pass a fresh genuine hosted inventory check, verify correctly labeled delivery into each existing Discord channel, and observe a scheduled run. A simulated webhook message does not establish monitoring.
+3. Preserve existing state and review pending/reserved/uncertain events before resuming to avoid duplicate notifications. Never upload an older baseline over newer workflow state.
+4. GitHub scheduling can be delayed; this remains a beta. No paid hosting or provider subscription has been purchased.
 
 ## Correctness and safety
 
