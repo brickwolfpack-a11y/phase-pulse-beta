@@ -1,8 +1,22 @@
 # PHASE PULSE beta
 
-Status: Discord TEST delivery and controlled duplicate prevention PASS; hosted retailer inventory FAIL. Automatic monitoring remains PAUSED and is NOT LIVE.
+Status: one genuine hosted Target shipping check PASSED; the second was rejected with HTTP 435 and a CAPTCHA indicator. Consistent monitoring is NOT verified. Schedule remains PAUSED.
 
-## Latest verification — October 8, 2026, 8:10 PM America/Chicago
+## Latest Target-only result — October 8, 2026, 8:15 PM CDT
+
+- Existing watchlist: 1 Target TCIN, 95120834 (Pokémon Mega Evolution Ascended Heroes Booster Bundle).
+- Direct request to the existing `product_fulfillment_and_variation_hierarchy_v1` source removed the unnecessary product-metadata lookup dependency. No fingerprint, cookie, proxy, credential or access-protection changes.
+- Check 1 PASS: HTTP 200, matching TCIN, `shipping_options.availability_status=OUT_OF_STOCK`, normalized `out_of_stock`, timestamp `2026-10-09T01:15:10.406500+00:00` (8:15:10 PM CDT). Product URL and prior metadata retained from the successful saved baseline. The price is historical metadata, not a freshly verified price.
+- Check 2 FAIL: HTTP 435 with a CAPTCHA indicator at `2026-10-09T01:15:19.623544+00:00`. Requests stopped immediately; no third attempt.
+- Two consecutive hosted checks: FAIL. No schedule activation and no new Discord webhook tests.
+- Exact evidence saved under `direct_shipping_checks` in `verification.json`; production inventory baseline and configuration remain unchanged.
+- Run: https://github.com/brickwolfpack-a11y/phase-pulse-beta/actions/runs/37868846468
+- The existing Travis-ML backup uses the same Redsky fulfillment source; switching to it would not establish an independent supported source. Its browser-impersonation approach was not adopted. No supported alternative public inventory feed was established by the focused source review.
+- Best next action: obtain a supported Target feed through the existing dedicated-provider trial inquiries (Zephyr/Moonitor), or approved retailer API access. Preserve the working Discord delivery and do not retry the challenged source or move it to another network to evade screening.
+
+
+
+## Earlier verification — October 8, 2026, 8:10 PM America/Chicago
 
 | Check | Result | Evidence |
 | --- | --- | --- |
