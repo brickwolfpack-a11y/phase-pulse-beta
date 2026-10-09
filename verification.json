@@ -16,8 +16,11 @@
       "duplicate_logic": "PASS",
       "simulated_transition": "PASS",
       "attempted": "2026-10-09T01:08:28.480479+00:00",
-      "delivery": "reserved",
-      "expected_channel": "1557676779651473448"
+      "delivery": "PASS",
+      "expected_channel": "1557676779651473448",
+      "message_id": "1557922671851737169",
+      "channel_id": "1557676779651473448",
+      "completed_at": "2026-10-09T01:08:31.834920+00:00"
     }
   }
 }
