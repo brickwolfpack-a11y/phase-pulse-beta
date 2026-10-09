@@ -1,6 +1,30 @@
 # PHASE PULSE beta
 
-Status: deployed; monitoring PAUSED after the first hosted inventory test failed. Discord delivery remains unverified.
+Status: Discord TEST delivery and controlled duplicate prevention PASS; hosted retailer inventory FAIL. Automatic monitoring remains PAUSED and is NOT LIVE.
+
+## Latest verification — October 8, 2026, 8:10 PM America/Chicago
+
+| Check | Result | Evidence |
+| --- | --- | --- |
+| Discord Target TEST | PASS | Message 1557922652516122640 in existing channel 1557676686143656007 |
+| Discord Walmart TEST | PASS | Message 1557922671851737169 in existing channel 1557676779651473448 |
+| Hosted Target inventory | FAIL | Search returned HTTP 200 and 24 records at 01:08 UTC; subsequent product-detail request returned HTTP 435 at 01:10 UTC. Search alone is not fulfillment verification. |
+| Hosted Walmart inventory | FAIL | HTTP 412; response contains a CAPTCHA indicator. Requests stopped; no bypass attempted. |
+| Duplicate prevention | PASS (controlled) | Baseline + unchanged state produce zero events; simulated OOS to in-stock produces one event; two unchanged observations produce zero more events; repeat delivery sends nothing. |
+| Scheduled automatic monitoring | FAIL / paused | PULSE_ENABLED remains false. Two manually dispatched jobs ran independently, but no successful scheduled inventory run is established. |
+| Genuine restock observed | NO | Both new Discord messages explicitly say TEST ONLY and simulated transition. |
+
+Exactly one TEST message was sent per existing GitHub-configured retailer webhook, at 8:08 PM CDT. Returned Discord channel IDs matched, and both messages were visually confirmed in the PHASE channels. The second manual verification retained the saved delivery evidence without resending either message or retrying Walmart.
+
+Production `state.json`, `report.json`, configuration, monitor code and scheduled workflow were unchanged. Test state is isolated in `verification.json`; original local inventory baseline remains preserved. No purchases or personal bot access.
+
+Verification runs:
+- https://github.com/brickwolfpack-a11y/phase-pulse-beta/actions/runs/37868291042
+- https://github.com/brickwolfpack-a11y/phase-pulse-beta/actions/runs/37868444906
+
+Next: resolve supported hosted inventory access, then complete two successful genuine checks per retailer and verify unchanged inventory produces no duplicate alerts. Only after those checks pass should the schedule be enabled and the next scheduled state commit verified. Do not repeatedly dispatch diagnostic requests after the saved rejection.
+
+Supported-source investigation: Walmart Marketplace inventory APIs manage seller inventory, while Scintilla Store Inventory is supplier-scoped and reports items not mapped to the supplier as errors. Neither establishes an available free consumer-wide Target/Walmart feed for this project. No supported public Target inventory API access was verified. Sources: https://developer.walmart.com/global-marketplace/docs/inventory-api-overview and https://developer.walmartdataventures.com/apis/reference/nrt-store-inventory-details .
 
 Run `python3 pulse.py check` from the repository root. Python 3.11+ standard library only: no npm install, browser runtime, personal bot session, proxy, or retailer account required.
 
@@ -12,7 +36,7 @@ Run `python3 pulse.py check` from the repository root. Python 3.11+ standard lib
 - Pokémon, One Piece, Panini, Topps and Funko keyword searches configured. Configuration does not imply that every category produced a matching first-party item.
 - Zero genuine stock-change events observed during baseline; zero Discord messages sent.
 
-## Deployment checkpoint — 2026-10-09 UTC
+## Earlier deployment checkpoint — before Discord verification
 
 - Repository, Python monitor, tests, persistent inventory state and workflow saved.
 - Existing Target and Walmart Discord webhooks stored as encrypted Actions secrets `DISCORD_TARGET_WEBHOOK_URL` and `DISCORD_WALMART_WEBHOOK_URL`; no channels or webhooks duplicated.
