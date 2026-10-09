@@ -34,7 +34,7 @@ def request(url, payload=None):
             if len(body)>5_000_000: raise CheckError('Response exceeds size limit')
             text = body.decode('utf-8')
     except urllib.error.HTTPError as e:
-        raise CheckError('HTTP '+str(e.code), e.code in (401,403,429)) from None
+        raise CheckError('HTTP '+str(e.code), e.code in (401,403,412,429,435)) from None
     except (urllib.error.URLError, TimeoutError, OSError):
         raise CheckError('Network request failed; no automatic retry') from None
     if payload is None and re.search(r'<title[^>]*>[^<]*(robot or human|access denied)|verify you are human|px-captcha',text,re.I):
@@ -55,7 +55,8 @@ def target_get(endpoint, params, cfg):
     except ValueError: raise CheckError('Invalid Target JSON') from None
 
 def target_status(fulfillment):
-    s=fulfillment.get('shipping_options',{}).get('availability_status')
+    shipping=fulfillment.get('shipping_options') if isinstance(fulfillment,dict) else None
+    s=shipping.get('availability_status') if isinstance(shipping,dict) else None
     return {'IN_STOCK':'in_stock','OUT_OF_STOCK':'out_of_stock','PRE_ORDER_SELLABLE':'pre_order','PRE_ORDER_UNSELLABLE':'pre_order_unavailable','UNAVAILABLE':'unavailable'}.get(s,'unknown')
 
 def walmart_status(item):
@@ -93,31 +94,34 @@ def check_walmart(cfg,old):
     return list(products.values()),raw
 
 def check_target(cfg,old):
-    # Per-product fulfillment avoids false OOS from truncated search result pages.
-    ids=list(dict.fromkeys(cfg['target_tcins']+list(old.get('products',{}))))
-    for term in cfg['search_keywords']:
-        d=target_get('plp_search_v2',{'keyword':term,'count':24,'offset':0,'default_purchasability_filter':'false','page':'/search','platform':'desktop'},cfg)
-        rows=d.get('data',{}).get('search',{}).get('products')
-        if not isinstance(rows,list):raise CheckError('Target search schema changed')
-        for raw in rows:
-            item=raw.get('item',{})
-            if item.get('fulfillment',{}).get('is_marketplace') is False and matches(item.get('product_description',{}).get('title',''),cfg):
-                if str(raw['tcin']) not in ids:ids.append(str(raw['tcin']))
-        time.sleep(cfg['request_spacing_seconds'])
-    products=[]
-    for tcin in ids[:cfg['max_target_products']]:
-        d=target_get('pdp_client_v1',{'tcin':tcin},cfg);prod=d.get('data',{}).get('product',{})
-        if str(prod.get('tcin'))!=tcin:raise CheckError('Target product identity mismatch')
-        item=prod.get('item',{});name=html.unescape(item.get('product_description',{}).get('title',''))
-        if item.get('fulfillment',{}).get('is_marketplace') is True or not matches(name,cfg):continue
-        url=item.get('enrichment',{}).get('buy_url','')
-        if not valid_url(url,'target'):raise CheckError('Invalid Target product URL')
-        time.sleep(cfg['request_spacing_seconds'])
+    import discovery
+    if cfg.get('paused_retailers',{}).get('target'):
+        raise CheckError(cfg['paused_retailers']['target'],True)
+    try: discovery.collect(cfg,old,target_get,now,time.sleep)
+    except (ValueError,CheckError) as exc:
+        # Discovery and known-product inventory are complementary. A malformed
+        # search page or ordinary network failure must not disable saved TCINs.
+        # Access challenges are different: stop ALL Target traffic immediately.
+        if isinstance(exc,CheckError) and exc.pause:raise
+        old.setdefault('discovery',{})['last_error']=str(exc)
+        old['discovery']['last_run']={**old['discovery'].get('last_run',{}),'status':'error'}
+    ids=discovery.select_watchlist(cfg,old);products=[]
+    for tcin in ids:
+        metadata=old.get('discovery',{}).get('products',{}).get(tcin) or old.get('products',{}).get(tcin)
+        if not metadata or not valid_url(metadata.get('url',''),'target'):
+            raise CheckError('Target metadata not verified for TCIN '+tcin)
+        if not re.fullmatch(r'\d{7,10}',str(tcin)):raise CheckError('Invalid Target TCIN')
         d=target_get('product_fulfillment_and_variation_hierarchy_v1',{'tcin':tcin,'page':'/p/A-'+tcin},cfg)
-        p=d.get('data',{}).get('product',{})
-        if str(p.get('tcin'))!=tcin or not isinstance(p.get('fulfillment'),dict):raise CheckError('Target fulfillment missing')
-        f=p['fulfillment'];products.append({'id':tcin,'name':name,'url':url,'status':target_status(f),'checked_at':now(),'evidence':'shipping_options.availability_status','price':prod.get('price',{}).get('current_retail')})
-        time.sleep(cfg['request_spacing_seconds'])
+        data=d.get('data') if isinstance(d,dict) else None
+        product=data.get('product') if isinstance(data,dict) else None
+        if not isinstance(product,dict):raise CheckError('Target product response schema changed')
+        if str(product.get('tcin'))!=tcin or not isinstance(product.get('fulfillment'),dict):raise CheckError('Target fulfillment missing')
+        fulfillment=product['fulfillment']
+        products.append({'id':tcin,'name':metadata['name'],'url':metadata['url'],
+            'status':target_status(fulfillment),'checked_at':now(),
+            'source_status':(fulfillment.get('shipping_options') or {}).get('availability_status') if isinstance(fulfillment.get('shipping_options'),dict) else None,
+            'evidence':'shipping_options.availability_status','price':metadata.get('price'),'image':metadata.get('image')})
+        time.sleep(max(2,cfg.get('request_spacing_seconds',2)))
     return products,len(ids)
 
 def merge(old,rows,retailer):
@@ -125,9 +129,9 @@ def merge(old,rows,retailer):
     for p in rows:
         previous=products.get(p['id']); status=p['status']
         if status=='unknown':continue  # Retain prior evidence, never manufacture a transition.
-        if previous and previous['status'] in ('out_of_stock','unavailable','pre_order_unavailable','pre_order') and status=='in_stock':
+        if previous and ((previous['status'] in ('out_of_stock','unavailable','pre_order_unavailable','pre_order') and status=='in_stock') or (previous['status'] in ('out_of_stock','unavailable','pre_order_unavailable') and status=='pre_order')):
             key=hashlib.sha256((retailer+p['id']+previous['checked_at']+status).encode()).hexdigest()[:24]
-            events.append({'event_id':key,'retailer':retailer,'product':p,'previous_status':previous['status'],'delivery':'pending','created_at':now()})
+            events.append({'event_id':key,'kind':'preorder_open' if status=='pre_order' else 'restock','retailer':retailer,'product':p,'previous_status':previous['status'],'delivery':'pending','created_at':now()})
         products[p['id']]=p  # Newly observed products silently baseline, even after initial run.
     return events
 
@@ -135,6 +139,9 @@ def check(cfg,state):
     report={'checked_at':now(),'retailers':{},'alerts_sent':0}
     for retailer,fn in [('target',check_target),('walmart',check_walmart)]:
         old=state.setdefault(retailer,{'products':{}})
+        configured_pause=cfg.get('paused_retailers',{}).get(retailer)
+        if configured_pause:
+            report['retailers'][retailer]={'status':'paused','reason':configured_pause,'last_success':old.get('last_success')};continue
         if old.get('paused'):
             report['retailers'][retailer]={'status':'paused','reason':old['paused']};continue
         try:
@@ -145,12 +152,53 @@ def check(cfg,state):
             if known:old['last_success']=now()
             old['last_error']=None
             report['retailers'][retailer]={'status':'ok' if known else 'no_verified_inventory','products_checked':len(known),'records_retrieved':raw,'baseline_total':len(old['products']),'in_stock':sum(p['status']=='in_stock' for p in known),'new_restock_events':len(events),'last_success':old.get('last_success')}
+            if retailer=='target':
+                report['retailers'][retailer]['discovery']=old.get('discovery',{}).get('last_run',{})
+                if old.get('discovery',{}).get('last_error'):
+                    report['retailers'][retailer].update(status='partial' if known else 'error',discovery_error=old['discovery']['last_error'])
         except CheckError as e:
             old['last_error']=str(e)
             if e.pause:old['paused']=str(e)
             report['retailers'][retailer]={'status':'paused' if e.pause else 'error','reason':str(e),'last_success':old.get('last_success')}
+    report['new_listing_events_queued']=queue_discoveries(state)
     write(STATE,state);write(REPORT,report);print(json.dumps(report,indent=2))
     return 0 if all(r['status']=='ok' for r in report['retailers'].values()) else 1
+
+def queue_discoveries(state):
+    """Use the existing durable outbox; replaying the discovery journal is safe."""
+    outbox=state.setdefault('outbox',[]);known={e['event_id'] for e in outbox};count=0
+    for e in state.get('target',{}).get('discovery',{}).get('events',[]):
+        if e['event_id'] in known:continue
+        # Old journals predate notification support. Do not replay old catalog events.
+        if e.get('notification_version')!=1:continue
+        p={'id':e['tcin'],'name':e['name'],'url':e['url'],'price':e.get('price'),
+           'image':e.get('image'),'seller':e.get('seller','unknown'),'status':'unknown',
+           'checked_at':e['observed_at'],'evidence':'Target search listing; availability unverified'}
+        outbox.append({'event_id':e['event_id'],'kind':'new_listing','retailer':'target',
+                       'product':p,'previous_status':'not previously tracked','delivery':'pending',
+                       'created_at':e['observed_at']})
+        known.add(e['event_id']);count+=1
+    return count
+
+def alert_payload(event):
+    p=event['product'];kind=event.get('kind','restock')
+    labels={'new_listing':'NEW TO MONITOR','preorder_open':'PREORDER OPEN','restock':'RESTOCK'}
+    descriptions={'new_listing':'Relevant listing newly found by PHASE. Availability and retailer publication date are unverified.',
+                  'preorder_open':'Retailer reports preorder availability. Availability can change.',
+                  'restock':'Retailer reports in stock. Availability can change.'}
+    fields=[{'name':'Retailer','value':event['retailer']},
+            {'name':'TCIN' if event['retailer']=='target' else 'Product ID','value':str(p['id'])},
+            {'name':'Price','value':str(p.get('price') or 'Not provided by source')[:1024]},
+            {'name':'Evidence','value':p['evidence']},
+            {'name':'Previous status','value':event['previous_status']}]
+    if kind=='new_listing':fields.append({'name':'Seller classification','value':p.get('seller','unknown')})
+    embed={'title':(labels[kind]+' • '+p['name'])[:256],'url':p['url'],
+           'description':descriptions[kind],'timestamp':p['checked_at'],'fields':fields,
+           'footer':{'text':'PHASE PULSE BETA • '+event['event_id']}}
+    image=p.get('image')
+    if isinstance(image,str) and urllib.parse.urlsplit(image).scheme=='https' and urllib.parse.urlsplit(image).hostname=='target.scene7.com':
+        embed['thumbnail']={'url':image}
+    return {'username':'PHASE PULSE • BETA','allowed_mentions':{'parse':[]},'embeds':[embed]}
 
 def webhook(retailer):
     url=os.environ.get('DISCORD_'+retailer.upper()+'_WEBHOOK_URL','')
@@ -178,12 +226,12 @@ def deliver(cfg,state):
             event['delivery']='expired';continue
         url=webhook(event['retailer'])
         event['delivery']='attempting';write(STATE,state)
-        payload={'username':'PHASE PULSE • BETA','allowed_mentions':{'parse':[]},'embeds':[{'title':('RESTOCK • '+p['name'])[:256],'url':p['url'],'description':'Retailer reports in stock. Availability can change.','timestamp':p['checked_at'],'fields':[{'name':'Retailer','value':event['retailer']},{'name':'Stock evidence','value':p['evidence']},{'name':'Previous status','value':event['previous_status']}],'footer':{'text':'PHASE PULSE BETA • '+event['event_id']}}]}
+        payload=alert_payload(event)
         try:
             result=json.loads(request(url+'?wait=true',payload));event['discord_message_id']=result['id'];event['delivery']='sent';sent+=1
         except (CheckError,ValueError,KeyError):event['delivery']='uncertain';write(STATE,state);raise CheckError('Discord delivery uncertain; manual review, no auto-retry') from None
         write(STATE,state);time.sleep(2)
-    write(STATE,state);print(json.dumps({'genuine_restock_alerts_sent':sent}));return 0
+    write(STATE,state);print(json.dumps({'alerts_sent':sent}));return 0
 
 if __name__=='__main__':
     ap=argparse.ArgumentParser();ap.add_argument('mode',choices=['check','reserve','deliver']);args=ap.parse_args()
