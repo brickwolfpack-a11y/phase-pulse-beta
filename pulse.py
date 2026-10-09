@@ -55,7 +55,8 @@ def target_get(endpoint, params, cfg):
     except ValueError: raise CheckError('Invalid Target JSON') from None
 
 def target_status(fulfillment):
-    s=fulfillment.get('shipping_options',{}).get('availability_status')
+    shipping=fulfillment.get('shipping_options') if isinstance(fulfillment,dict) else None
+    s=shipping.get('availability_status') if isinstance(shipping,dict) else None
     return {'IN_STOCK':'in_stock','OUT_OF_STOCK':'out_of_stock','PRE_ORDER_SELLABLE':'pre_order','PRE_ORDER_UNSELLABLE':'pre_order_unavailable','UNAVAILABLE':'unavailable'}.get(s,'unknown')
 
 def walmart_status(item):
@@ -97,19 +98,28 @@ def check_target(cfg,old):
     if cfg.get('paused_retailers',{}).get('target'):
         raise CheckError(cfg['paused_retailers']['target'],True)
     try: discovery.collect(cfg,old,target_get,now,time.sleep)
-    except ValueError as exc: raise CheckError(str(exc)) from None
+    except (ValueError,CheckError) as exc:
+        # Discovery and known-product inventory are complementary. A malformed
+        # search page or ordinary network failure must not disable saved TCINs.
+        # Access challenges are different: stop ALL Target traffic immediately.
+        if isinstance(exc,CheckError) and exc.pause:raise
+        old.setdefault('discovery',{})['last_error']=str(exc)
+        old['discovery']['last_run']={**old['discovery'].get('last_run',{}),'status':'error'}
     ids=discovery.select_watchlist(cfg,old);products=[]
     for tcin in ids:
         metadata=old.get('discovery',{}).get('products',{}).get(tcin) or old.get('products',{}).get(tcin)
         if not metadata or not valid_url(metadata.get('url',''),'target'):
             raise CheckError('Target metadata not verified for TCIN '+tcin)
+        if not re.fullmatch(r'\d{7,10}',str(tcin)):raise CheckError('Invalid Target TCIN')
         d=target_get('product_fulfillment_and_variation_hierarchy_v1',{'tcin':tcin,'page':'/p/A-'+tcin},cfg)
-        product=d.get('data',{}).get('product',{})
+        data=d.get('data') if isinstance(d,dict) else None
+        product=data.get('product') if isinstance(data,dict) else None
+        if not isinstance(product,dict):raise CheckError('Target product response schema changed')
         if str(product.get('tcin'))!=tcin or not isinstance(product.get('fulfillment'),dict):raise CheckError('Target fulfillment missing')
         fulfillment=product['fulfillment']
         products.append({'id':tcin,'name':metadata['name'],'url':metadata['url'],
             'status':target_status(fulfillment),'checked_at':now(),
-            'source_status':fulfillment.get('shipping_options',{}).get('availability_status'),
+            'source_status':(fulfillment.get('shipping_options') or {}).get('availability_status') if isinstance(fulfillment.get('shipping_options'),dict) else None,
             'evidence':'shipping_options.availability_status'})
         time.sleep(max(2,cfg.get('request_spacing_seconds',2)))
     return products,len(ids)
@@ -142,6 +152,10 @@ def check(cfg,state):
             if known:old['last_success']=now()
             old['last_error']=None
             report['retailers'][retailer]={'status':'ok' if known else 'no_verified_inventory','products_checked':len(known),'records_retrieved':raw,'baseline_total':len(old['products']),'in_stock':sum(p['status']=='in_stock' for p in known),'new_restock_events':len(events),'last_success':old.get('last_success')}
+            if retailer=='target':
+                report['retailers'][retailer]['discovery']=old.get('discovery',{}).get('last_run',{})
+                if old.get('discovery',{}).get('last_error'):
+                    report['retailers'][retailer].update(status='partial' if known else 'error',discovery_error=old['discovery']['last_error'])
         except CheckError as e:
             old['last_error']=str(e)
             if e.pause:old['paused']=str(e)
