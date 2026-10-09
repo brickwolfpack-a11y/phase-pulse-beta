@@ -22,5 +22,23 @@
       "channel_id": "1557676779651473448",
       "completed_at": "2026-10-09T01:08:31.834920+00:00"
     }
+  },
+  "hosted": {
+    "target": {
+      "checked_at": "2026-10-09T01:08:32.868638+00:00",
+      "requests": 1,
+      "result": "FAIL",
+      "endpoint": "redsky.target.com/redsky_aggregations/v1/web/plp_search_v2",
+      "user_agent": "PHASE-PULSE-Beta/0.1",
+      "cookies": false,
+      "retry": false,
+      "http_status": 200,
+      "content_type": "application/json",
+      "server": "istio-envoy",
+      "response_bytes": 68422,
+      "challenge_signals": [],
+      "search_records": 24,
+      "note": "Search response alone is insufficient: per-product fulfillment still requires verification."
+    }
   }
 }
