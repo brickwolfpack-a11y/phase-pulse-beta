@@ -105,10 +105,43 @@ def diagnose(d):
         except Exception as exc:entry['error_type']=type(exc).__name__
         d['hosted'][retailer]=entry;save(d);persist()
 
+
+def target_fulfillment(d):
+    # Proceed only after a normal search response, never after a current challenge.
+    if 'target_fulfillment_checks' in d or d.get('hosted',{}).get('target',{}).get('http_status')!=200:return
+    cfg=pulse.load(ROOT/'config.json',{})
+    tcin=cfg['target_tcins'][0]
+    isolated=copy.deepcopy(pulse.load(ROOT/'state.json',{})['target'])
+    results=[]
+    for attempt in range(2):
+        entry={'checked_at':pulse.now(),'result':'FAIL','tcin':tcin}
+        try:
+            response=pulse.target_get('pdp_client_v1',{'tcin':tcin},cfg)
+            product=response.get('data',{}).get('product',{})
+            if str(product.get('tcin'))!=tcin:raise pulse.CheckError('Target product identity mismatch')
+            item=product.get('item',{});url=item.get('enrichment',{}).get('buy_url','')
+            if not pulse.valid_url(url,'target'):raise pulse.CheckError('Invalid product link')
+            pulse.time.sleep(2)
+            response=pulse.target_get('product_fulfillment_and_variation_hierarchy_v1',{'tcin':tcin,'page':'/p/A-'+tcin},cfg)
+            stock=response.get('data',{}).get('product',{})
+            if str(stock.get('tcin'))!=tcin:raise pulse.CheckError('Target fulfillment identity mismatch')
+            status=pulse.target_status(stock.get('fulfillment',{}))
+            if status=='unknown':raise pulse.CheckError('No explicit shipping inventory')
+            row={'id':tcin,'name':item.get('product_description',{}).get('title',''),'url':url,'status':status,'checked_at':pulse.now(),'evidence':'shipping_options.availability_status'}
+            changes=pulse.merge(isolated,[row],'target')
+            entry.update(result='PASS',product=row,detected_changes=len(changes))
+            if results and results[0].get('product',{}).get('status')==status:
+                assert not changes
+                entry['unchanged_inventory_duplicate_check']='PASS'
+        except pulse.CheckError as exc:entry['reason']=str(exc)
+        results.append(entry);d['target_fulfillment_checks']=results;save(d);persist()
+        if entry['result']!='PASS':break
+        pulse.time.sleep(2)
+
 def main():
     before={name:hashlib.sha256((ROOT/name).read_bytes()).hexdigest() for name in ['state.json','report.json']}
     d=pulse.load(LEDGER,{'run_id':os.environ.get('PULSE_RUN_ID'),'created_at':pulse.now()})
-    tests(d);diagnose(d)
+    tests(d);diagnose(d);target_fulfillment(d)
     after={name:hashlib.sha256((ROOT/name).read_bytes()).hexdigest() for name in before}
     assert before==after,'Production baseline changed unexpectedly'
     d['baseline_preserved']=True;d['completed_at']=pulse.now();save(d);persist()
