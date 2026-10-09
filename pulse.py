@@ -120,7 +120,7 @@ def check_target(cfg,old):
         products.append({'id':tcin,'name':metadata['name'],'url':metadata['url'],
             'status':target_status(fulfillment),'checked_at':now(),
             'source_status':(fulfillment.get('shipping_options') or {}).get('availability_status') if isinstance(fulfillment.get('shipping_options'),dict) else None,
-            'evidence':'shipping_options.availability_status'})
+            'evidence':'shipping_options.availability_status','price':metadata.get('price'),'image':metadata.get('image')})
         time.sleep(max(2,cfg.get('request_spacing_seconds',2)))
     return products,len(ids)
 
@@ -129,9 +129,9 @@ def merge(old,rows,retailer):
     for p in rows:
         previous=products.get(p['id']); status=p['status']
         if status=='unknown':continue  # Retain prior evidence, never manufacture a transition.
-        if previous and previous['status'] in ('out_of_stock','unavailable','pre_order_unavailable','pre_order') and status=='in_stock':
+        if previous and ((previous['status'] in ('out_of_stock','unavailable','pre_order_unavailable','pre_order') and status=='in_stock') or (previous['status'] in ('out_of_stock','unavailable','pre_order_unavailable') and status=='pre_order')):
             key=hashlib.sha256((retailer+p['id']+previous['checked_at']+status).encode()).hexdigest()[:24]
-            events.append({'event_id':key,'retailer':retailer,'product':p,'previous_status':previous['status'],'delivery':'pending','created_at':now()})
+            events.append({'event_id':key,'kind':'preorder_open' if status=='pre_order' else 'restock','retailer':retailer,'product':p,'previous_status':previous['status'],'delivery':'pending','created_at':now()})
         products[p['id']]=p  # Newly observed products silently baseline, even after initial run.
     return events
 
@@ -160,8 +160,45 @@ def check(cfg,state):
             old['last_error']=str(e)
             if e.pause:old['paused']=str(e)
             report['retailers'][retailer]={'status':'paused' if e.pause else 'error','reason':str(e),'last_success':old.get('last_success')}
+    report['new_listing_events_queued']=queue_discoveries(state)
     write(STATE,state);write(REPORT,report);print(json.dumps(report,indent=2))
     return 0 if all(r['status']=='ok' for r in report['retailers'].values()) else 1
+
+def queue_discoveries(state):
+    """Use the existing durable outbox; replaying the discovery journal is safe."""
+    outbox=state.setdefault('outbox',[]);known={e['event_id'] for e in outbox};count=0
+    for e in state.get('target',{}).get('discovery',{}).get('events',[]):
+        if e['event_id'] in known:continue
+        # Old journals predate notification support. Do not replay old catalog events.
+        if e.get('notification_version')!=1:continue
+        p={'id':e['tcin'],'name':e['name'],'url':e['url'],'price':e.get('price'),
+           'image':e.get('image'),'seller':e.get('seller','unknown'),'status':'unknown',
+           'checked_at':e['observed_at'],'evidence':'Target search listing; availability unverified'}
+        outbox.append({'event_id':e['event_id'],'kind':'new_listing','retailer':'target',
+                       'product':p,'previous_status':'not previously tracked','delivery':'pending',
+                       'created_at':e['observed_at']})
+        known.add(e['event_id']);count+=1
+    return count
+
+def alert_payload(event):
+    p=event['product'];kind=event.get('kind','restock')
+    labels={'new_listing':'NEW TO MONITOR','preorder_open':'PREORDER OPEN','restock':'RESTOCK'}
+    descriptions={'new_listing':'Relevant listing newly found by PHASE. Availability and retailer publication date are unverified.',
+                  'preorder_open':'Retailer reports preorder availability. Availability can change.',
+                  'restock':'Retailer reports in stock. Availability can change.'}
+    fields=[{'name':'Retailer','value':event['retailer']},
+            {'name':'TCIN' if event['retailer']=='target' else 'Product ID','value':str(p['id'])},
+            {'name':'Price','value':str(p.get('price') or 'Not provided by source')[:1024]},
+            {'name':'Evidence','value':p['evidence']},
+            {'name':'Previous status','value':event['previous_status']}]
+    if kind=='new_listing':fields.append({'name':'Seller classification','value':p.get('seller','unknown')})
+    embed={'title':(labels[kind]+' • '+p['name'])[:256],'url':p['url'],
+           'description':descriptions[kind],'timestamp':p['checked_at'],'fields':fields,
+           'footer':{'text':'PHASE PULSE BETA • '+event['event_id']}}
+    image=p.get('image')
+    if isinstance(image,str) and urllib.parse.urlsplit(image).scheme=='https' and urllib.parse.urlsplit(image).hostname=='target.scene7.com':
+        embed['thumbnail']={'url':image}
+    return {'username':'PHASE PULSE • BETA','allowed_mentions':{'parse':[]},'embeds':[embed]}
 
 def webhook(retailer):
     url=os.environ.get('DISCORD_'+retailer.upper()+'_WEBHOOK_URL','')
@@ -189,12 +226,12 @@ def deliver(cfg,state):
             event['delivery']='expired';continue
         url=webhook(event['retailer'])
         event['delivery']='attempting';write(STATE,state)
-        payload={'username':'PHASE PULSE • BETA','allowed_mentions':{'parse':[]},'embeds':[{'title':('RESTOCK • '+p['name'])[:256],'url':p['url'],'description':'Retailer reports in stock. Availability can change.','timestamp':p['checked_at'],'fields':[{'name':'Retailer','value':event['retailer']},{'name':'Stock evidence','value':p['evidence']},{'name':'Previous status','value':event['previous_status']}],'footer':{'text':'PHASE PULSE BETA • '+event['event_id']}}]}
+        payload=alert_payload(event)
         try:
             result=json.loads(request(url+'?wait=true',payload));event['discord_message_id']=result['id'];event['delivery']='sent';sent+=1
         except (CheckError,ValueError,KeyError):event['delivery']='uncertain';write(STATE,state);raise CheckError('Discord delivery uncertain; manual review, no auto-retry') from None
         write(STATE,state);time.sleep(2)
-    write(STATE,state);print(json.dumps({'genuine_restock_alerts_sent':sent}));return 0
+    write(STATE,state);print(json.dumps({'alerts_sent':sent}));return 0
 
 if __name__=='__main__':
     ap=argparse.ArgumentParser();ap.add_argument('mode',choices=['check','reserve','deliver']);args=ap.parse_args()

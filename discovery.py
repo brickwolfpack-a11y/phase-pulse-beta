@@ -27,7 +27,11 @@ def normalize(raw, cfg, observed_at):
     marketplace=item.get('fulfillment',{}).get('is_marketplace')
     relation=item.get('relationship_type','')
     seller='marketplace' if marketplace is True or relation.startswith('TargetPlus') else 'target' if marketplace is False else 'unknown'
-    return {'id':tcin,'name':name,'url':url,'category':category,'seller':seller,
+    price=raw.get('price',{}).get('formatted_current_price')
+    if not isinstance(price,str):price=None
+    image=item.get('enrichment',{}).get('images',{}).get('primary_image_url')
+    if not isinstance(image,str) or urlsplit(image).scheme!='https' or urlsplit(image).hostname!='target.scene7.com':image=None
+    return {'id':tcin,'name':name,'url':url,'category':category,'seller':seller,'price':price,'image':image,
             'eligible_for_inventory':seller=='target','discovered_at':observed_at,
             'last_seen':observed_at,'source':'target_search','inventory_status':'unknown'}
 
@@ -57,8 +61,8 @@ def absorb(discovery,rows,scope,observed_at):
         products[tcin]={**copy.deepcopy(row),'first_seen':first,'last_seen':observed_at}
         if not old and not is_baseline:
             key=hashlib.sha256(('target:new_listing:'+tcin).encode()).hexdigest()[:24]
-            events.append({'event_id':key,'kind':'new_listing','retailer':'target','tcin':tcin,
-                           'name':row['name'],'url':row['url'],'observed_at':observed_at,
+            events.append({'notification_version':1,'event_id':key,'kind':'new_listing','retailer':'target','tcin':tcin,
+                           'name':row['name'],'url':row['url'],'price':row.get('price'),'image':row.get('image'),'seller':row.get('seller','unknown'),'observed_at':observed_at,
                            'inventory_status':'unknown','note':'New to this monitor; retailer publication date unknown'})
     if is_baseline:scopes.append(scope)
     journal=discovery.setdefault('events',[]);known={e['event_id'] for e in journal}
