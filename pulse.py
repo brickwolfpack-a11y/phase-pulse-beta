@@ -1,0 +1,192 @@
+"""PHASE PULSE conservative beta, adapted from pokemon-restock (MIT)
+and Travis-ML/target-stock-monitor (MIT). Python 3.11+, stdlib only.
+No cookies, proxy rotation, browser impersonation or block bypass.
+"""
+import argparse, datetime as dt, hashlib, html, json, os, pathlib, re, time
+import urllib.request, urllib.parse, urllib.error, uuid
+ROOT = pathlib.Path(__file__).resolve().parent
+STATE = ROOT / 'state.json'
+REPORT = ROOT / 'report.json'
+KEY = '9f36aeafbe60771e321a7cc95a78140772ab3e96'  # Public frontend key; not a credential.
+BASE = 'https://redsky.target.com/redsky_aggregations/v1/web/'
+VISITOR = str(uuid.uuid4())
+class CheckError(Exception):
+    def __init__(self, message, pause=False):
+        super().__init__(message); self.pause = pause
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+def now(): return dt.datetime.now(dt.timezone.utc).isoformat()
+def write(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix('.tmp'); tmp.write_text(json.dumps(data, indent=2)); tmp.replace(path)
+def load(path, default):
+    return json.loads(path.read_text()) if path.exists() else default
+
+def request(url, payload=None):
+    headers = {'User-Agent': 'PHASE-PULSE-Beta/0.1', 'Accept': 'application/json,text/html'}
+    if payload is not None: headers['Content-Type'] = 'application/json'
+    req = urllib.request.Request(url, data=json.dumps(payload).encode() if payload is not None else None, headers=headers)
+    try:
+        with urllib.request.build_opener(NoRedirect).open(req, timeout=25) as r:
+            body = r.read(5_000_001)
+            if len(body)>5_000_000: raise CheckError('Response exceeds size limit')
+            text = body.decode('utf-8')
+    except urllib.error.HTTPError as e:
+        raise CheckError('HTTP '+str(e.code), e.code in (401,403,429)) from None
+    except (urllib.error.URLError, TimeoutError, OSError):
+        raise CheckError('Network request failed; no automatic retry') from None
+    if payload is None and re.search(r'<title[^>]*>[^<]*(robot or human|access denied)|verify you are human|px-captcha',text,re.I):
+        raise CheckError('Retailer access challenge; manual review required', True)
+    return text
+
+def folded(s):
+    import unicodedata
+    return ''.join(c for c in unicodedata.normalize('NFD',html.unescape(s).lower()) if unicodedata.category(c)!='Mn')
+def matches(name, cfg): return any(k in folded(name) for k in cfg['include_keywords'])
+def valid_url(url, retailer):
+    p=urllib.parse.urlparse(url)
+    return p.scheme=='https' and p.hostname in (retailer+'.com','www.'+retailer+'.com') and not p.username
+
+def target_get(endpoint, params, cfg):
+    args={'key':KEY,'visitor_id':VISITOR,'store_id':cfg['target_store_id'],'pricing_store_id':cfg['target_store_id'],'zip':cfg['target_zip'],'channel':'WEB',**params}
+    try: return json.loads(request(BASE+endpoint+'?'+urllib.parse.urlencode(args)))
+    except ValueError: raise CheckError('Invalid Target JSON') from None
+
+def target_status(fulfillment):
+    s=fulfillment.get('shipping_options',{}).get('availability_status')
+    return {'IN_STOCK':'in_stock','OUT_OF_STOCK':'out_of_stock','PRE_ORDER_SELLABLE':'pre_order','PRE_ORDER_UNSELLABLE':'pre_order_unavailable','UNAVAILABLE':'unavailable'}.get(s,'unknown')
+
+def walmart_status(item):
+    av=item.get('availabilityStatusV2',{}).get('value')
+    if item.get('isOutOfStock') is True or av=='OUT_OF_STOCK': return 'out_of_stock'
+    if av=='IN_STOCK' and item.get('isOutOfStock') is not True:
+        return 'pre_order' if item.get('preOrder',{}).get('isPreOrder') is True else 'in_stock'
+    return 'unknown'  # Never infer inventory from missing fields or an Add to cart flag.
+
+def walmart_parse(text,cfg):
+    m=re.search(r'<script[^>]+id=["\x27]__NEXT_DATA__["\x27][^>]*>([\s\S]*?)</script>',text,re.I)
+    if not m: raise CheckError('Walmart structured data missing; inventory unknown')
+    try:
+        d=json.loads(m[1]); stacks=d['props']['pageProps']['initialData']['searchResult']['itemStacks']
+    except (ValueError,KeyError,TypeError): raise CheckError('Walmart response schema changed') from None
+    products=[]; raw_count=0
+    for stack in stacks:
+        for item in stack.get('items',[]):
+            if not item.get('usItemId'):continue
+            raw_count+=1
+            if item.get('sellerName')!='Walmart.com':continue
+            name=item.get('name','')
+            if not matches(name,cfg):continue
+            url=urllib.parse.urljoin('https://www.walmart.com',item.get('canonicalUrl','').split('?')[0])
+            if not valid_url(url,'walmart') or not url.startswith('https://www.walmart.com/ip/'):continue
+            products.append({'id':str(item['usItemId']),'name':name,'url':url,'status':walmart_status(item),'seller':'Walmart.com','checked_at':now(),'evidence':'retailer_search_availability','price':item.get('price')})
+    if not raw_count:raise CheckError('No product records; empty search is not an inventory check')
+    return products,raw_count
+
+def check_walmart(cfg,old):
+    products={};raw=0
+    for term in cfg['search_keywords']:
+        rows,count=walmart_parse(request('https://www.walmart.com/search?'+urllib.parse.urlencode({'q':term,'page':1})),cfg)
+        raw+=count;products.update({p['id']:p for p in rows});time.sleep(cfg['request_spacing_seconds'])
+    return list(products.values()),raw
+
+def check_target(cfg,old):
+    # Per-product fulfillment avoids false OOS from truncated search result pages.
+    ids=list(dict.fromkeys(cfg['target_tcins']+list(old.get('products',{}))))
+    for term in cfg['search_keywords']:
+        d=target_get('plp_search_v2',{'keyword':term,'count':24,'offset':0,'default_purchasability_filter':'false','page':'/search','platform':'desktop'},cfg)
+        rows=d.get('data',{}).get('search',{}).get('products')
+        if not isinstance(rows,list):raise CheckError('Target search schema changed')
+        for raw in rows:
+            item=raw.get('item',{})
+            if item.get('fulfillment',{}).get('is_marketplace') is False and matches(item.get('product_description',{}).get('title',''),cfg):
+                if str(raw['tcin']) not in ids:ids.append(str(raw['tcin']))
+        time.sleep(cfg['request_spacing_seconds'])
+    products=[]
+    for tcin in ids[:cfg['max_target_products']]:
+        d=target_get('pdp_client_v1',{'tcin':tcin},cfg);prod=d.get('data',{}).get('product',{})
+        if str(prod.get('tcin'))!=tcin:raise CheckError('Target product identity mismatch')
+        item=prod.get('item',{});name=html.unescape(item.get('product_description',{}).get('title',''))
+        if item.get('fulfillment',{}).get('is_marketplace') is True or not matches(name,cfg):continue
+        url=item.get('enrichment',{}).get('buy_url','')
+        if not valid_url(url,'target'):raise CheckError('Invalid Target product URL')
+        time.sleep(cfg['request_spacing_seconds'])
+        d=target_get('product_fulfillment_and_variation_hierarchy_v1',{'tcin':tcin,'page':'/p/A-'+tcin},cfg)
+        p=d.get('data',{}).get('product',{})
+        if str(p.get('tcin'))!=tcin or not isinstance(p.get('fulfillment'),dict):raise CheckError('Target fulfillment missing')
+        f=p['fulfillment'];products.append({'id':tcin,'name':name,'url':url,'status':target_status(f),'checked_at':now(),'evidence':'shipping_options.availability_status','price':prod.get('price',{}).get('current_retail')})
+        time.sleep(cfg['request_spacing_seconds'])
+    return products,len(ids)
+
+def merge(old,rows,retailer):
+    events=[];products=old.setdefault('products',{})
+    for p in rows:
+        previous=products.get(p['id']); status=p['status']
+        if status=='unknown':continue  # Retain prior evidence, never manufacture a transition.
+        if previous and previous['status'] in ('out_of_stock','unavailable','pre_order_unavailable','pre_order') and status=='in_stock':
+            key=hashlib.sha256((retailer+p['id']+previous['checked_at']+status).encode()).hexdigest()[:24]
+            events.append({'event_id':key,'retailer':retailer,'product':p,'previous_status':previous['status'],'delivery':'pending','created_at':now()})
+        products[p['id']]=p  # Newly observed products silently baseline, even after initial run.
+    return events
+
+def check(cfg,state):
+    report={'checked_at':now(),'retailers':{},'alerts_sent':0}
+    for retailer,fn in [('target',check_target),('walmart',check_walmart)]:
+        old=state.setdefault(retailer,{'products':{}})
+        if old.get('paused'):
+            report['retailers'][retailer]={'status':'paused','reason':old['paused']};continue
+        try:
+            rows,raw=fn(cfg,old)
+            known=[p for p in rows if p['status']!='unknown']
+            events=merge(old,rows,retailer)
+            state.setdefault('outbox',[]).extend(events)
+            if known:old['last_success']=now()
+            old['last_error']=None
+            report['retailers'][retailer]={'status':'ok' if known else 'no_verified_inventory','products_checked':len(known),'records_retrieved':raw,'baseline_total':len(old['products']),'in_stock':sum(p['status']=='in_stock' for p in known),'new_restock_events':len(events),'last_success':old.get('last_success')}
+        except CheckError as e:
+            old['last_error']=str(e)
+            if e.pause:old['paused']=str(e)
+            report['retailers'][retailer]={'status':'paused' if e.pause else 'error','reason':str(e),'last_success':old.get('last_success')}
+    write(STATE,state);write(REPORT,report);print(json.dumps(report,indent=2))
+    return 0 if all(r['status']=='ok' for r in report['retailers'].values()) else 1
+
+def webhook(retailer):
+    url=os.environ.get('DISCORD_'+retailer.upper()+'_WEBHOOK_URL','')
+    if not re.fullmatch(r'https://discord\.com/api/webhooks/\d+/[A-Za-z0-9_-]+',url):raise CheckError('Missing or invalid '+retailer+' webhook secret')
+    return url
+
+def reserve(cfg,state):
+    token=os.environ.get('PULSE_RUN_ID')
+    if not token:raise CheckError('PULSE_RUN_ID required for durable delivery reservations')
+    reserved=0
+    for event in state.get('outbox',[]):
+        if event['delivery']=='pending' and reserved<cfg['max_alerts_per_run']:
+            # Validate the secret before consuming a notification.
+            webhook(event['retailer'])
+            event['delivery']='reserved';event['reservation']=token;reserved+=1
+    write(STATE,state);print(json.dumps({'reserved':reserved}));return 0
+
+def deliver(cfg,state):
+    # An ambiguous result is held for review, never blindly retried.
+    sent=0
+    for event in state.get('outbox',[]):
+        if event['delivery']!='reserved' or event.get('reservation')!=os.environ.get('PULSE_RUN_ID') or sent>=cfg['max_alerts_per_run']:continue
+        p=event['product']
+        if (dt.datetime.now(dt.timezone.utc)-dt.datetime.fromisoformat(p['checked_at'])).total_seconds()>900:
+            event['delivery']='expired';continue
+        url=webhook(event['retailer'])
+        event['delivery']='attempting';write(STATE,state)
+        payload={'username':'PHASE PULSE • BETA','allowed_mentions':{'parse':[]},'embeds':[{'title':('RESTOCK • '+p['name'])[:256],'url':p['url'],'description':'Retailer reports in stock. Availability can change.','timestamp':p['checked_at'],'fields':[{'name':'Retailer','value':event['retailer']},{'name':'Stock evidence','value':p['evidence']},{'name':'Previous status','value':event['previous_status']}],'footer':{'text':'PHASE PULSE BETA • '+event['event_id']}}]}
+        try:
+            result=json.loads(request(url+'?wait=true',payload));event['discord_message_id']=result['id'];event['delivery']='sent';sent+=1
+        except (CheckError,ValueError,KeyError):event['delivery']='uncertain';write(STATE,state);raise CheckError('Discord delivery uncertain; manual review, no auto-retry') from None
+        write(STATE,state);time.sleep(2)
+    write(STATE,state);print(json.dumps({'genuine_restock_alerts_sent':sent}));return 0
+
+if __name__=='__main__':
+    ap=argparse.ArgumentParser();ap.add_argument('mode',choices=['check','reserve','deliver']);args=ap.parse_args()
+    cfg=load(ROOT/'config.json',{});state=load(STATE,{'outbox':[]})
+    try:raise SystemExit({'check':check,'reserve':reserve,'deliver':deliver}[args.mode](cfg,state))
+    except CheckError as e:print(str(e));raise SystemExit(1)

@@ -1,0 +1,11 @@
+{
+  "search_keywords": ["pokemon elite trainer box", "one piece trading cards", "panini sports cards", "topps trading cards", "funko pop"],
+  "include_keywords": ["pokemon", "one piece", "panini", "topps", "funko"],
+  "target_tcins": ["95120834"],
+  "target_store_id": "1375",
+  "target_zip": "55403",
+  "max_target_products": 12,
+  "search_pages": 1,
+  "request_spacing_seconds": 2,
+  "max_alerts_per_run": 10
+}
