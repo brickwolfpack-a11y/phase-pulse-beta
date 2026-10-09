@@ -1,0 +1,25 @@
+name: PHASE PULSE Manual Verification
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: phase-pulse-beta
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      PULSE_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Configure evidence commits
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+      - name: Verify labeled test delivery and inspect hosted responses
+        env:
+          DISCORD_TARGET_WEBHOOK_URL: ${{ secrets.DISCORD_TARGET_WEBHOOK_URL }}
+          DISCORD_WALMART_WEBHOOK_URL: ${{ secrets.DISCORD_WALMART_WEBHOOK_URL }}
+        run: python3 verify_monitor.py
